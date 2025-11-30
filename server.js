@@ -1,15 +1,18 @@
-// server.js - Srivaari Capital backend (simple JSON file storage)
+// server.js - Srivaari Capital backend (improved for session reliability)
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const bodyParser = require('body-parser');
 const bcrypt = require('bcryptjs');
 const session = require('express-session');
+const FileStore = require('session-file-store')(session);
 const cors = require('cors');
 
 const PORT = process.env.PORT || 3000;
 const SESSION_SECRET = process.env.SESSION_SECRET || 'change_this_now';
 const ADMIN_PASS = process.env.ADMIN_PASS || 'adminpass';
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:3000'; // set to your frontend origin
+const NODE_ENV = process.env.NODE_ENV || 'development';
 
 const DATA_FILE = path.join(__dirname, 'data.json');
 if (!fs.existsSync(DATA_FILE)) {
@@ -24,126 +27,46 @@ function writeData(d) {
 }
 
 const app = express();
-app.use(cors({ origin: true, credentials: true }));
+
+// CORS - allow only the frontend origin (important when credentials are used)
+app.use(cors({
+  origin: (origin, cb) => {
+    // allow if no origin (e.g., curl / server-to-server) OR matches FRONTEND_ORIGIN
+    if (!origin || origin === FRONTEND_ORIGIN) return cb(null, true);
+    return cb(new Error('CORS not allowed'), false);
+  },
+  credentials: true,
+}));
+
 app.use(bodyParser.json());
 
+// Session store (persistent file store). Replace with redis for production-scale.
+const isProduction = NODE_ENV === 'production';
 app.use(session({
-  name: 'sriv_session',
+  name: 'srivaari.sid',
+  store: new FileStore({ path: path.join(__dirname, 'sessions') }),
   secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
-  cookie: { httpOnly: true, secure: false, maxAge: 24*60*60*1000 }
+  cookie: {
+    httpOnly: true,
+    secure: isProduction,                      // must be true in production (HTTPS)
+    maxAge: 24 * 60 * 60 * 1000,              // 1 day
+    sameSite: isProduction ? 'none' : 'lax'   // 'none' for cross-site in prod; 'lax' for local dev
+  }
 }));
 
+// simple request logger for debugging
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} - origin: ${req.headers.origin || 'none'}`);
+  next();
+});
+
 // health
-app.get('/api/health', (req, res) => res.json({ ok:true, ts: Date.now() }));
+app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 // Signup
 app.post('/api/signup', (req, res) => {
   try {
-    const { name, phone, email, password } = req.body;
-    if (!email || !password || !phone) return res.status(400).json({ error: 'Missing email, password or phone' });
-    const data = readData();
-    const existing = data.users.find(u => u.email && u.email.toLowerCase() === email.toLowerCase());
-    if (existing) return res.status(400).json({ error: 'Email already registered' });
-    const hash = bcrypt.hashSync(password, 10);
-    const id = Date.now();
-    const user = { id, name: name||null, phone, email: email.toLowerCase(), password_hash: hash, created_at: new Date().toISOString() };
-    data.users.push(user);
-    writeData(data);
-    req.session.userId = id;
-    req.session.email = user.email;
-    res.json({ success:true, id });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error:'Server error' });
-  }
-});
+    const { name, phon
 
-// Login
-app.post('/api/login', (req, res) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Missing email or password' });
-    const data = readData();
-    const user = data.users.find(u => u.email && u.email.toLowerCase() === email.toLowerCase());
-    if (!user) return res.status(400).json({ error: 'Invalid credentials' });
-    const ok = bcrypt.compareSync(password, user.password_hash);
-    if (!ok) return res.status(400).json({ error: 'Invalid credentials' });
-    req.session.userId = user.id;
-    req.session.email = user.email;
-    req.session.name = user.name || null;
-    req.session.phone = user.phone || null;
-    res.json({ success:true, id: user.id, name: user.name });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error:'Server error' });
-  }
-});
-
-// Logout
-app.post('/api/logout', (req, res) => {
-  req.session.destroy(err => {
-    if (err) return res.status(500).json({ error:'Unable to logout' });
-    res.json({ success:true });
-  });
-});
-
-// whoami
-app.get('/api/me', (req, res) => {
-  if (!req.session || !req.session.userId) return res.json({ loggedIn:false });
-  return res.json({
-    loggedIn: true,
-    id: req.session.userId,
-    email: req.session.email,
-    name: req.session.name,
-    phone: req.session.phone
-  });
-});
-
-// require auth middleware
-function requireAuth(req, res, next) {
-  if (req.session && req.session.userId) return next();
-  return res.status(401).json({ error: 'Authentication required' });
-}
-
-// apply (protected)
-app.post('/api/apply', requireAuth, (req, res) => {
-  try {
-    const { name, phone, email, address, loan_amount, purpose, monthly_income } = req.body;
-    if (!name || !phone || !loan_amount) return res.status(400).json({ error: 'Missing required fields' });
-    const data = readData();
-    const id = Date.now();
-    const row = {
-      id,
-      user_id: req.session.userId,
-      name, phone, email: email||null, address: address||null,
-      loan_amount: Number(loan_amount),
-      purpose: purpose||null,
-      monthly_income: monthly_income ? Number(monthly_income) : null,
-      created_at: new Date().toISOString()
-    };
-    data.applications.push(row);
-    writeData(data);
-    res.json({ success:true, id });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error:'Server error' });
-  }
-});
-
-// admin: list applications (simple admin pass)
-app.get('/api/admin/applications', (req, res) => {
-  const pass = req.headers['x-admin-pass'] || '';
-  if (pass !== ADMIN_PASS) return res.status(401).json({ error:'Unauthorized' });
-  const data = readData();
-  res.json({ applications: data.applications });
-});
-
-// static
-app.get('/', (req, res) => res.send('Srivaari Capital backend is running.'));
-
-// start
-app.listen(PORT, () => {
-  console.log('Server started on port', PORT);
-});
